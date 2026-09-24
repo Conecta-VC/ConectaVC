@@ -94,12 +94,30 @@
   #topbar .meet-info{font-size:14px;color:var(--muted);display:flex;gap:10px;align-items:center;}
   #topbar .meet-info b{color:var(--text);font-weight:500;}
   #main{flex:1;display:flex;overflow:hidden;}
-  #gridWrap{flex:1;padding:12px;overflow:auto;}
+  #gridWrap{flex:1;padding:12px;overflow:auto;display:flex;flex-direction:column;}
   #videoGrid{
-    height:100%;display:grid;gap:10px;
+    flex:1;display:grid;gap:8px;
     grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
     grid-auto-rows:1fr;
   }
+  /* Paisagem (16:9, telas largas) — até 50 participantes por página, tiles menores */
+  @media (orientation:landscape){
+    #videoGrid{ grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+  }
+  /* Retrato (9:16, celular) — até 10 participantes por página, tiles maiores */
+  @media (orientation:portrait){
+    #videoGrid{ grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); grid-auto-rows:minmax(120px,1fr); }
+  }
+  .tile[data-page-hidden="true"]{display:none;}
+  #pagination{
+    display:none;align-items:center;justify-content:center;gap:16px;padding:10px 0 2px;color:var(--muted);font-size:13px;flex-shrink:0;
+  }
+  #pagination.show{display:flex;}
+  #pagination button{
+    background:#3c4043;color:#fff;width:32px;height:32px;border-radius:50%;font-size:16px;display:flex;align-items:center;justify-content:center;
+  }
+  #pagination button:hover{background:#4a4d51;}
+  #pagination button:disabled{opacity:.3;cursor:default;}
   .tile{
     position:relative;background:#3c4043;border-radius:12px;overflow:hidden;
     display:flex;align-items:center;justify-content:center;min-height:140px;
@@ -231,7 +249,14 @@
     <div class="meet-info" id="participantCountLabel">1 participante</div>
   </div>
   <div id="main">
-    <div id="gridWrap"><div id="videoGrid"></div></div>
+    <div id="gridWrap">
+      <div id="videoGrid"></div>
+      <div id="pagination">
+        <button id="prevPageBtn" onclick="changePage(-1)">‹</button>
+        <span id="pageLabel">Página 1/1</span>
+        <button id="nextPageBtn" onclick="changePage(1)">›</button>
+      </div>
+    </div>
     <div class="sidepanel" id="chatPanel">
       <div class="sp-header">Chat <span class="close-x" onclick="togglePanel('chatPanel')">✕</span></div>
       <div id="chatMessages"></div>
@@ -410,6 +435,23 @@ function saveMeetingToHistory(code){
 }
 /* ================== FIM FIREBASE ================== */
 
+/* ===================== CONFIG DE REDE (ICE / TURN) =====================
+   Sem servidor TURN, a chamada só funciona quando as duas pessoas estão em
+   redes "abertas" (mesmo WiFi, por exemplo). Com pessoas em redes diferentes
+   (WiFi + 4G, redes corporativas, etc.) é comum a conexão nunca fechar e
+   nada aparecer. Estes servidores TURN públicos e gratuitos (OpenRelay)
+   resolvem isso na maioria dos casos. Para uso sério/produção, o ideal é
+   usar um TURN próprio (ex: metered.ca, Twilio, ou seu próprio coturn).
+============================================================================ */
+const ICE_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "turn:openrelay.metered.ca:80", username:"openrelayproject", credential:"openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443", username:"openrelayproject", credential:"openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443?transport=tcp", username:"openrelayproject", credential:"openrelayproject" }
+  ]
+};
+
 /* ===================== ESTADO GLOBAL ===================== */
 let localStream, screenStream, peer, myName='', myId='', roomCode='', isHost=false;
 let micOn=true, camOn=true, handUp=false, mirrored=true, screenSharing=false;
@@ -477,7 +519,7 @@ function joinMeeting(){
 
 function startPeer(hostIdAttempt, wantsHost, joinTargetId){
   if(wantsHost){
-    peer = new Peer(hostIdAttempt);
+    peer = new Peer(hostIdAttempt, {config: ICE_CONFIG});
     peer.on('open', id=>{
       myId = id; isHost = true; knownPeers.add(id);
       enterCallScreen();
@@ -490,7 +532,7 @@ function startPeer(hostIdAttempt, wantsHost, joinTargetId){
       } else toast('Erro: '+err.type);
     });
   } else {
-    peer = new Peer();
+    peer = new Peer({config: ICE_CONFIG});
     peer.on('open', id=>{
       myId = id; isHost=false; knownPeers.add(id);
       enterCallScreen();
@@ -500,24 +542,47 @@ function startPeer(hostIdAttempt, wantsHost, joinTargetId){
   }
 
   peer.on('call', call=>{
+    knownPeers.add(call.peer);
     call.answer(getOutgoingStream());
     registerCall(call);
   });
   peer.on('connection', conn=>{
     setupDataConn(conn, false, true);
   });
+  peer.on('disconnected', ()=>{
+    toast('Conexão instável — tentando reconectar...');
+    peer.reconnect();
+  });
 }
 
 function connectToHost(hostId){
+  knownPeers.add(hostId);
   hostConn = peer.connect(hostId);
   setupDataConn(hostConn, true, false);
   const call = peer.call(hostId, getOutgoingStream());
   registerCall(call);
 }
 
+/* Evita conexões duplicadas: entre dois peers que não são o host, só quem
+   tem o ID "maior" (comparação de string) inicia a conexão; o outro só
+   responde. Sem isso, os dois lados tentavam se conectar ao mesmo tempo,
+   criando conexões duplicadas e causando falhas intermitentes de áudio/vídeo. */
+function connectToPeer(id){
+  if(id===myId || knownPeers.has(id)) return;
+  knownPeers.add(id);
+  if(myId > id){
+    const conn = peer.connect(id);
+    setupDataConn(conn, false, false);
+    const call = peer.call(id, getOutgoingStream());
+    registerCall(call);
+  }
+  // se myId < id, apenas aguarda a conexão/chamada que o outro peer vai iniciar
+}
+
 /* ===================== CONEXÕES DE DADOS (mesh) ===================== */
 function setupDataConn(conn, isConnToHost, iAmHostSide){
   conn.on('open', ()=>{
+    knownPeers.add(conn.peer);
     peers[conn.peer] = peers[conn.peer] || {};
     peers[conn.peer].dataConn = conn;
     conn.send({type:'hello', name:myName, micOn, camOn});
@@ -540,24 +605,10 @@ function handleData(fromId, data){
     updateNameTag(fromId);
     refreshPeopleList();
   } else if(data.type==='peerlist'){
-    data.peers.forEach(id=>{
-      if(id!==myId && !knownPeers.has(id)){
-        knownPeers.add(id);
-        const conn = peer.connect(id);
-        setupDataConn(conn, false, false);
-        const call = peer.call(id, getOutgoingStream());
-        registerCall(call);
-      }
-    });
+    data.peers.forEach(id=> connectToPeer(id));
     knownPeers.add(myId);
   } else if(data.type==='newpeer'){
-    if(data.id!==myId && !knownPeers.has(data.id)){
-      knownPeers.add(data.id);
-      const conn = peer.connect(data.id);
-      setupDataConn(conn, false, false);
-      const call = peer.call(data.id, getOutgoingStream());
-      registerCall(call);
-    }
+    connectToPeer(data.id);
   } else if(data.type==='chat'){
     addChatMessage(data.name, data.text, false);
   } else if(data.type==='reaction'){
@@ -590,6 +641,7 @@ function registerCall(call){
     addOrUpdateTile(call.peer, remoteStream, false);
   });
   call.on('close', ()=> removePeerTile(call.peer));
+  call.on('error', ()=> toast('Falha ao conectar com um participante.'));
 }
 
 /* ===================== UI: TELA DE CHAMADA ===================== */
@@ -630,6 +682,7 @@ function addOrUpdateTile(id, stream, isMe){
   tile.querySelector('video').srcObject = stream;
   if(!isMe){ setupSpeakingDetection(id, stream); updateNameTag(id); }
   updateParticipantCount();
+  updatePagination();
 }
 
 function updateNameTag(id){
@@ -646,12 +699,50 @@ function removePeerTile(id){
   knownPeers.delete(id);
   refreshPeopleList();
   updateParticipantCount();
+  updatePagination();
 }
 
 function updateParticipantCount(){
   const n = Object.keys(peers).filter(id=>id!==myId).length + 1;
   document.getElementById('participantCountLabel').textContent = n+(n===1?' participante':' participantes');
 }
+
+/* ===================== PAGINAÇÃO DA GRADE =====================
+   Paisagem (16:9): até 50 participantes por página.
+   Retrato (9:16, celular): até 10 participantes por página.
+   Isso evita renderizar dezenas de vídeos simultâneos na tela (o que
+   travaria o navegador) — cada "página" só mostra o vídeo de quem está
+   nela; os outros ficam pausados/ocultos até você navegar até lá. */
+let currentPage = 0;
+function getPageSize(){
+  return window.matchMedia('(orientation: portrait)').matches ? 10 : 50;
+}
+function updatePagination(){
+  const pageSize = getPageSize();
+  const tiles = Array.from(document.querySelectorAll('#videoGrid .tile'));
+  const totalPages = Math.max(1, Math.ceil(tiles.length / pageSize));
+  if(currentPage > totalPages-1) currentPage = totalPages-1;
+  tiles.forEach((tile, i)=>{
+    const onThisPage = Math.floor(i/pageSize) === currentPage;
+    tile.dataset.pageHidden = onThisPage ? 'false' : 'true';
+    // pausa o vídeo de quem não está na página atual, pra economizar CPU/banda
+    const vid = tile.querySelector('video');
+    if(vid){
+      if(onThisPage){ if(vid.paused) vid.play().catch(()=>{}); }
+      else vid.pause();
+    }
+  });
+  const pag = document.getElementById('pagination');
+  pag.classList.toggle('show', totalPages>1);
+  document.getElementById('pageLabel').textContent = `Página ${currentPage+1}/${totalPages}`;
+  document.getElementById('prevPageBtn').disabled = currentPage===0;
+  document.getElementById('nextPageBtn').disabled = currentPage>=totalPages-1;
+}
+function changePage(delta){
+  currentPage += delta;
+  updatePagination();
+}
+window.addEventListener('resize', updatePagination);
 
 /* ===================== DETECÇÃO DE QUEM ESTÁ FALANDO ===================== */
 function setupSpeakingDetection(id, stream){
